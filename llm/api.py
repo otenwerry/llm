@@ -70,6 +70,9 @@ class Reply:
     id: str = ""  # Provider response ID, for tracing and billing reconciliation.
     seconds: float | None = None  # How long the reply took to arrive (its last attempt only); None for batches.
     longest_gap: float | None = None  # Longest wait in seconds between streamed events; None for batches.
+    # Tries before the one that worked, each {"error", "cost"}; cost is None when the provider reported none. `cost`
+    # above includes the reported ones; an unreported one counts only as unknown in LLM.cost.
+    failed_attempts: list = field(default_factory=list)
 
 
 class Clock:
@@ -456,15 +459,18 @@ class LLM:
             reply = await self._batched(api, model, request)
         else:
             async with self.slots[api]:
+                failed = []
                 for attempt in range(self.max_retries + 1):
                     try:
                         reply = await getattr(self, "_" + api)(model, dict(request))
+                        reply.failed_attempts = failed + reply.failed_attempts
                         break
                     except httpx2.TransportError as e:
                         # The reply stalled or broke off mid-stream, which the SDKs' own retries don't cover.
                         self._record(model, None)  # It may have been billed before it was abandoned.
                         if attempt == self.max_retries:
                             raise
+                        failed.append({"error": f"{type(e).__name__} mid-reply: {e}", "cost": None})
                         print(f"{model}: {type(e).__name__} mid-reply; sending again "
                               f"({attempt + 1}/{self.max_retries})", flush=True)
                         await asyncio.sleep(2 ** attempt)
@@ -681,7 +687,7 @@ class LLM:
         """OpenRouter adds `reasoning`, and `reasoning_details`, which some models need sent back with their tool
         calls. A host error that arrives as a normal-looking response (no reply, or finish_reason "error") is retried
         like any other temporary error, and whatever the failed tries cost is added to the reply's cost."""
-        spec, total = self.models[model], 0.0
+        spec, failed = self.models[model], []
         for attempt in range(self.max_retries + 1):
             try:
                 response, clock = await self._openrouter_stream(request)
@@ -694,12 +700,16 @@ class LLM:
             host = response.get("provider")
             usage = response.get("usage") or {}
             cost = self._record(model, usage.get("cost"))
-            total = None if total is None or cost is None else total + cost
             if response.get("choices") and response["choices"][0].get("finish_reason") not in ("error", None):
                 break
+            error = response.get("error") or "the reply ended without a finish reason"
             if attempt == self.max_retries:
-                raise RuntimeError(f"No reply from {host} after {attempt + 1} tries: {response.get('error')}")
+                raise RuntimeError(f"No reply from {host} after {attempt + 1} tries: {error}")
+            failed.append({"error": f"{host}: {error}", "cost": cost})
+            print(f"{model}: {host} error ({error}); sending again ({attempt + 1}/{self.max_retries})", flush=True)
             await asyncio.sleep(2 ** attempt)
+        known = [a["cost"] for a in failed if a["cost"] is not None]
+        total = None if cost is None else cost + sum(known)
         choice = response["choices"][0]
         reply = choice["message"]
         text = reply.get("content") or ""
@@ -714,7 +724,7 @@ class LLM:
         stop = choice["finish_reason"]
         return clock.stamp(Reply(text, reasoning, tool_calls, message, STOP_REASONS["openrouter"].get(stop, "other"),
                                  stop, host, total, usage, shared_logprobs(logprobs) if logprobs else None,
-                                 id=response.get("id", "")))
+                                 id=response.get("id", ""), failed_attempts=failed))
 
     async def _batched(self, api, model, request):
         """Queue a request, bounding both wait time and request count."""

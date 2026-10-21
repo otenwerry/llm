@@ -471,3 +471,18 @@ def test_openrouter_error_mid_stream_is_retried(monkeypatch):
         reply = await llm.ask('qwen-3.7-plus', MESSAGES)
         assert reply.text == 'ok' and call.await_count == 2 and reply.cost == llm.cost == .24  # Usage came before the error.
     asyncio.run(run())
+
+
+def test_failed_attempts_are_recorded_and_reported_costs_kept(monkeypatch):
+    monkeypatch.setattr('llm.api.asyncio.sleep', AsyncMock())
+    async def run():
+        unreported = response('openrouter', choices=[], usage=None)
+        reported = response('openrouter', choices=[])
+        stall = MidStream(raw=response('openrouter'), error=httpx.ReadTimeout('no data'))
+        llm, _, _ = setup('openrouter', [stall, unreported, reported, response('openrouter')])
+        reply = await llm.ask('qwen-3.7-plus', MESSAGES)
+        assert [a['cost'] for a in reply.failed_attempts] == [None, None, .12]
+        assert 'ReadTimeout' in reply.failed_attempts[0]['error'] and 'mock' in reply.failed_attempts[1]['error']
+        assert reply.cost == pytest.approx(.24)  # This try and the one reported failure; unreported ones aren't guessed.
+        assert llm.cost is None and llm.known_cost == pytest.approx(.24)  # The stall cut off its usage.
+    asyncio.run(run())
