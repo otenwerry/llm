@@ -174,11 +174,18 @@ long_price = { above = 272_000, input = 5.00, output = 22.50, cache_read = 0.50,
 
 # OpenRouter, each pinned to the model's maker
 
+["argon-4"]
+api = "openrouter"
+id = "google/gemini-4-argon"
+caching = "free"
+host = "google-vertex"  # Zero data retention; AI Studio isn't
+max_tokens = 65_536  # Vertex's us endpoint limit (its global one takes 943,718)
+
 ["gemini-3.1-pro"]
 api = "openrouter"
 id = "google/gemini-3.1-pro-preview"
 caching = "free"
-host = "google-ai-studio"
+host = "google-vertex"  # Zero data retention; AI Studio isn't
 max_tokens = 65_536
 
 ["grok-4.7"]
@@ -245,6 +252,13 @@ caching = "free"
 host = "z-ai"
 max_tokens = 131_072
 
+["glm-5.1"]
+api = "openrouter"
+id = "z-ai/glm-5.1"
+caching = "free"
+host = "z-ai"
+max_tokens = 131_072
+
 ["qwen-3.7-plus"]
 api = "openrouter"
 id = "qwen/qwen3.7-plus"
@@ -276,7 +290,7 @@ caching = "none"
 host = "google-vertex"
 max_tokens = 65_536
 
-["llama-4-maverick"]
+["maverick-4"]
 api = "openrouter"
 id = "meta-llama/llama-4-maverick"
 caching = "free"

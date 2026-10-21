@@ -12,7 +12,7 @@ from openai.types.chat import ChatCompletion
 from openai.types.responses import Response
 
 from llm import LLM, MODELS
-from llm.api import anthropic_messages, openai_parts, price
+from llm.api import IDLE_TIMEOUT, anthropic_messages, merge_delta, openai_parts, price
 
 MODELS_BY_API = {'anthropic': 'opus-4.6', 'openai': 'gpt-5.5', 'openrouter': 'qwen-3.7-plus'}
 MESSAGES = [{'role': 'user', 'content': 'hi'}]
@@ -42,14 +42,50 @@ def response(api, **changes):
         usage={'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120, 'cost': .12}, provider='mock') | changes)
 
 
+class MidStream(NS):
+    """A reply that starts streaming and then fails with `error`, as a stalled or dropped connection does."""
+
+
+async def events(items, error=None):
+    for item in items:
+        yield item
+    if error:
+        raise error
+
+
+def streamed(api, raw, error=None):
+    """A whole reply as the stream its API sends. Anthropic's helper gives the final message; OpenAI's last event
+    carries the response; OpenRouter's reply arrives as a delta chunk and then a usage chunk."""
+    if api == 'anthropic':
+        class Stream:
+            def __aiter__(self):
+                return events([NS(type='message_start'), NS(type='message_stop')], error).__aiter__()
+            async def get_final_message(self):
+                return raw
+        return Stream()
+    if api == 'openai':
+        return events([NS(type='response.created'), NS(type=f'response.{raw.status}', response=raw)], error)
+    whole = raw.model_dump(exclude_none=True)
+    chunks = [{'id': whole['id'], 'provider': whole.get('provider'), 'choices': [
+        {'index': c['index'], 'delta': c['message'], 'finish_reason': c.get('finish_reason')}
+        for c in whole['choices']]}, {'id': whole['id'], 'choices': [], 'usage': whole.get('usage')}]
+    return events([NS(to_dict=lambda c=c: c) for c in chunks], error)
+
+
 def setup(api, replies=None, **options):
+    """Fake clients that stream each of `replies` in turn. A reply can also be an exception, raised when the
+    request is sent, or MidStream(raw=..., error=...), which fails partway through."""
     replies = iter(replies or [response(api)])
-    call = AsyncMock(side_effect=lambda **kwargs: next(replies))
+    call = AsyncMock(side_effect=lambda **kwargs: next(replies))  # Records each request's arguments.
+    async def open_stream(**kwargs):
+        item = await call(**kwargs)
+        if isinstance(item, Exception):
+            raise item
+        return streamed(api, item.raw, item.error) if isinstance(item, MidStream) else streamed(api, item)
     @asynccontextmanager
     async def stream(**kwargs):
-        result = await call(**kwargs)
-        yield NS(get_final_message=AsyncMock(return_value=result))
-    client = NS(close=AsyncMock(), responses=NS(create=call), chat=NS(completions=NS(create=call)),
+        yield await open_stream(**kwargs)
+    client = NS(close=AsyncMock(), responses=NS(create=open_stream), chat=NS(completions=NS(create=open_stream)),
                 messages=NS(stream=stream))
     return LLM(clients={api: client}, **options), client, call
 
@@ -245,7 +281,8 @@ def test_owned_client_closed_and_timeout_configured(monkeypatch):
         await llm.aclose()
         client.close.assert_awaited_once()
     asyncio.run(run())
-    assert factory.call_args.kwargs['timeout'] == 7
+    timeout = factory.call_args.kwargs['timeout']
+    assert timeout.connect == timeout.write == timeout.pool == 7 and timeout.read == IDLE_TIMEOUT
 
 
 def test_failed_openai_response_raises_but_keeps_usage():
@@ -365,3 +402,61 @@ def test_close_just_scheduled_batch_does_not_leave_waiters():
             await pending
         assert not llm.running
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('api', MODELS_BY_API)
+def test_stalled_reply_is_sent_again(api, monkeypatch):
+    monkeypatch.setattr('llm.api.asyncio.sleep', AsyncMock())
+    async def run():
+        stall = MidStream(raw=response(api), error=httpx.ReadTimeout('no data'))
+        llm, _, call = setup(api, [stall, response(api)])
+        reply = await llm.ask(MODELS_BY_API[api], MESSAGES)
+        assert reply.text == 'ok' and call.await_count == 2
+        assert llm.cost is None and llm.known_cost == reply.cost > 0  # The abandoned try may have been billed.
+        assert reply.seconds >= reply.longest_gap >= 0
+    asyncio.run(run())
+
+
+def test_stall_retries_give_up():
+    async def run():
+        stall = MidStream(raw=response('openai'), error=httpx.RemoteProtocolError('dropped'))
+        llm, _, call = setup('openai', [stall], max_retries=0)
+        with pytest.raises(httpx.RemoteProtocolError):
+            await llm.ask('gpt-5.5', MESSAGES)
+        assert call.await_count == 1 and llm.cost is None
+    asyncio.run(run())
+
+
+def test_openrouter_stream_reassembles_fragments():
+    async def run():
+        chunks = [
+            {'id': 'gen', 'provider': 'Host', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': 'He',
+                'reasoning': 'thi', 'reasoning_details': [{'type': 'reasoning.text', 'text': 'thi', 'index': 0}],
+                'tool_calls': [{'index': 0, 'id': 'call-1', 'type': 'function',
+                                'function': {'name': 'weather', 'arguments': '{"ci'}}]}}]},
+            {'id': 'gen', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': 'llo', 'reasoning': 'nk',
+                'reasoning_details': [{'type': 'reasoning.text', 'text': 'nk', 'index': 0},
+                                      {'type': 'reasoning.encrypted', 'data': 'xyz', 'index': 1}],
+                'tool_calls': [{'index': 0, 'id': 'call-1', 'function': {'arguments': 'ty": 1}'}}]},
+                'finish_reason': 'tool_calls'}]},
+            {'id': 'gen', 'choices': [], 'usage': {'prompt_tokens': 1, 'completion_tokens': 2, 'cost': .5}},
+        ]
+        llm, client, _ = setup('openrouter')
+        async def create(**kwargs):
+            assert kwargs['stream'] is True
+            return events([NS(to_dict=lambda c=c: c) for c in chunks])
+        client.chat.completions.create = create
+        reply = await llm.ask('qwen-3.7-plus', MESSAGES, tools=[TOOL])
+        assert reply.text == 'Hello' and reply.reasoning == 'think' and reply.host == 'Host' and reply.cost == .5
+        assert reply.tool_calls == [{'id': 'call-1', 'type': 'function',
+                                     'function': {'name': 'weather', 'arguments': '{"city": 1}'}}]
+        assert reply.message['reasoning_details'] == [{'type': 'reasoning.text', 'text': 'think', 'index': 0},
+                                                      {'type': 'reasoning.encrypted', 'data': 'xyz', 'index': 1}]
+        assert reply.stop_reason == 'tool_calls' and reply.id == 'gen'
+    asyncio.run(run())
+
+
+def test_merge_delta_appends_entries_without_index():
+    acc = merge_delta({}, {'reasoning_details': [{'type': 'a', 'text': 'x'}]})
+    merge_delta(acc, {'reasoning_details': [{'type': 'b', 'text': 'y'}]})
+    assert acc == {'reasoning_details': [{'type': 'a', 'text': 'x'}, {'type': 'b', 'text': 'y'}]}

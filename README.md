@@ -43,7 +43,7 @@ A spec needs `api`, `id`, `max_tokens`, and `caching`; OpenRouter also needs `ho
 
 `LLM(clients={"openai": custom_async_openai_client})` supports your own credentials, endpoint, headers, transport, and SDK configuration. Injected clients remain owned by you. Owned clients close with `async with LLM()` or `await llm.aclose()`. Use one instance per event loop.
 
-`LLM(timeout=3600, max_retries=5, concurrency=50)` configures owned clients and simultaneous calls per API. Injected clients retain their own SDK retry/timeout settings. Defaults route Claude/GPT directly and pin OpenRouter to one host; override the model spec or native provider options to change routing.
+`LLM(timeout=3600, idle_timeout=120, max_retries=5, concurrency=50)` configures owned clients and simultaneous calls per API. Replies stream from every API, so a stalled request is caught quickly: if no data at all arrives for `idle_timeout` seconds, or the connection drops mid-reply, the request is sent again (up to `max_retries` times, printing a line each time), and the abandoned try's cost counts as unknown. `timeout` covers connecting and sending. Injected clients retain their own SDK retry/timeout settings. Defaults route Claude/GPT directly and pin OpenRouter to one host; override the model spec or native provider options to change routing.
 
 ## Messages and settings
 
@@ -65,11 +65,11 @@ Messages and function tools use OpenAI chat format. Content accepts strings and 
 | `batch` | Per-call override of `LLM(batch=...)`. |
 | `extra_body` | Provider-native options merged over the generated body and recorded in `reply.settings`. |
 
-Unsupported shared options raise errors locally or at the provider. `extra_body` allows native options such as reasoning budgets, service tiers, or metadata. It cannot override model, conversation, streaming mode, or response count. Nested objects replace the corresponding object, so include every field needed. Native options may affect prices. The library returns complete replies; streaming, audio, and embeddings are outside this interface.
+Unsupported shared options raise errors locally or at the provider. `extra_body` allows native options such as reasoning budgets, service tiers, or metadata. It cannot override model, conversation, streaming mode, or response count. Nested objects replace the corresponding object, so include every field needed. Native options may affect prices. The library returns complete replies (it streams them internally, but doesn't hand callers partial replies); audio and embeddings are outside this interface.
 
 ## Replies and costs
 
-`Reply` includes `text`, `reasoning`, `tool_calls`, `message`, `stop_reason`, `api_stop_reason`, `host`, `usage`, `cost`, `logprobs`, `settings`, `model`, `model_id`, and provider response `id`. Usage preserves provider fields. Stop reasons normalize to `end`, `tool_calls`, `max_tokens`, `refusal`, `content_filter`, or `other`. OpenAI status `failed` raises an error.
+`Reply` includes `text`, `reasoning`, `tool_calls`, `message`, `stop_reason`, `api_stop_reason`, `host`, `usage`, `cost`, `logprobs`, `settings`, `model`, `model_id`, provider response `id`, `seconds` (how long the reply took), and `longest_gap` (the longest wait between streamed events, for choosing `idle_timeout`; both are None for batches). Usage preserves provider fields. Stop reasons normalize to `end`, `tool_calls`, `max_tokens`, `refusal`, `content_filter`, or `other`. OpenAI status `failed` raises an error.
 
 OpenRouter cost comes from reported usage. Direct cost is an **estimate** from usage and configured prices, including cache reads/writes, long prompts, and batch discounts. Keep prices current. Premium tiers and server tools are unpriced unless the estimator covers them; a spec's `service_tier` can identify the tier its prices apply to.
 

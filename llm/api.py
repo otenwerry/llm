@@ -6,16 +6,22 @@ have one shared name each, translated for every API; a setting a model can't tak
 import asyncio
 import json
 import os
+import time
 import tomllib
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import anthropic
+import httpx2
 import openai
 
 MODELS = tomllib.loads((Path(__file__).parent / "models.toml").read_text())
-TIMEOUT = 3600  # Seconds per request; a reply at the full output limit can take many minutes.
+TIMEOUT = 3600  # Seconds to connect, send, or wait for a free connection; replies themselves are limited by IDLE_TIMEOUT.
+# Seconds without receiving a single byte before a request counts as stalled and is sent again. Replies stream, and
+# every API sends something (text, reasoning, or a keep-alive) while a healthy reply is in progress; Reply.longest_gap
+# records the longest wait each reply actually had.
+IDLE_TIMEOUT = 120
 CONCURRENCY = 50  # Requests in flight at once per API, unless LLM(concurrency=...) says otherwise.
 NATIVE_KEYS = ("anthropic_content", "openai_output")  # Provider-specific copies kept on assistant messages.
 CACHE_TIMES = {True: "5m", "5m": "5m", "1h": "1h"}  # Accepted cache marks, and how long each keeps the text.
@@ -62,6 +68,55 @@ class Reply:
     model: str = ""  # The nickname asked for, as in models.toml.
     model_id: str = ""  # That model's name on the API it went to.
     id: str = ""  # Provider response ID, for tracing and billing reconciliation.
+    seconds: float | None = None  # How long the reply took to arrive (its last attempt only); None for batches.
+    longest_gap: float | None = None  # Longest wait in seconds between streamed events; None for batches.
+
+
+class Clock:
+    """Times one streamed reply: the whole of it, and the longest wait between events."""
+    def __init__(self):
+        self.start = self.last = time.monotonic()
+        self.longest = 0.0
+
+    def tick(self):
+        now = time.monotonic()
+        self.longest = max(self.longest, now - self.last)
+        self.last = now
+
+    def stamp(self, reply):
+        self.tick()
+        reply.seconds, reply.longest_gap = self.last - self.start, self.longest
+        return reply
+
+
+# Keys a streamed delta repeats rather than extends, so they are replaced instead of joined.
+REPLACED_KEYS = ("id", "type", "index", "role", "name", "format", "signature")
+
+
+def merge_delta(acc, delta):
+    """Add one streamed chunk's delta to the message built so far: text is joined, nested objects merged, and list
+    entries with the same `index` (tool calls, reasoning details) merged into one; entries without one are added."""
+    for key, value in delta.items():
+        if value is None:
+            continue
+        old = acc.get(key)
+        if isinstance(value, list):
+            entries = old if isinstance(old, list) else []
+            for entry in value:
+                same = [e for e in entries if isinstance(e, dict) and isinstance(entry, dict) and "index" in entry
+                        and e.get("index") == entry["index"]]
+                if same:
+                    merge_delta(same[0], entry)
+                else:
+                    entries.append(merge_delta({}, entry) if isinstance(entry, dict) else entry)
+            acc[key] = entries
+        elif isinstance(old, str) and isinstance(value, str) and key not in REPLACED_KEYS:
+            acc[key] = old + value
+        elif isinstance(old, dict) and isinstance(value, dict):
+            merge_delta(old, value)
+        else:
+            acc[key] = merge_delta({}, value) if isinstance(value, dict) else value
+    return acc
 
 
 def price(spec, uncached, cache_read, cache_write, output, cache_write_1h=0):
@@ -225,7 +280,8 @@ def shared_logprobs(tokens):
 
 
 class LLM:
-    def __init__(self, max_retries=5, concurrency=CONCURRENCY, batch=False, *, models=None, clients=None, timeout=TIMEOUT):
+    def __init__(self, max_retries=5, concurrency=CONCURRENCY, batch=False, *, models=None, clients=None, timeout=TIMEOUT,
+                 idle_timeout=IDLE_TIMEOUT):
         """batch=True sends Claude and GPT requests through their batch APIs: half price, but replies take minutes
         to hours (at most 24). `ask` works the same either way (see README.md)."""
         if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
@@ -236,6 +292,7 @@ class LLM:
         self.clients = dict(clients or {})  # Supplied clients remain owned by the caller.
         self.owned = set()
         self.timeout = timeout
+        self.idle_timeout = idle_timeout
         self.max_retries = max_retries
         self.cost = self.known_cost = 0.0
         self.costs = {}  # Totals become None if any observed charge is unknown.
@@ -293,7 +350,8 @@ class LLM:
         if api not in self.clients:
             if not os.environ.get(KEYS[api]):
                 raise ValueError(f"{KEYS[api]} isn't set; it's needed for models that go through {api}")
-            settings = {"api_key": os.environ[KEYS[api]], "max_retries": self.max_retries, "timeout": self.timeout}
+            settings = {"api_key": os.environ[KEYS[api]], "max_retries": self.max_retries,
+                        "timeout": httpx2.Timeout(self.timeout, read=self.idle_timeout)}
             self.clients[api] = (anthropic.AsyncAnthropic(**settings) if api == "anthropic" else openai.AsyncOpenAI(
                 **settings, **({"base_url": "https://openrouter.ai/api/v1"} if api == "openrouter" else {})))
             self.owned.add(api)
@@ -398,11 +456,21 @@ class LLM:
             reply = await self._batched(api, model, request)
         else:
             async with self.slots[api]:
-                try:
-                    reply = await getattr(self, "_" + api)(model, request)
-                except (openai.APIConnectionError, anthropic.APIConnectionError, asyncio.CancelledError):
-                    self._record(model, None)  # A request may have been billed before the connection was lost.
-                    raise
+                for attempt in range(self.max_retries + 1):
+                    try:
+                        reply = await getattr(self, "_" + api)(model, dict(request))
+                        break
+                    except httpx2.TransportError as e:
+                        # The reply stalled or broke off mid-stream, which the SDKs' own retries don't cover.
+                        self._record(model, None)  # It may have been billed before it was abandoned.
+                        if attempt == self.max_retries:
+                            raise
+                        print(f"{model}: {type(e).__name__} mid-reply; sending again "
+                              f"({attempt + 1}/{self.max_retries})", flush=True)
+                        await asyncio.sleep(2 ** attempt)
+                    except (openai.APIConnectionError, anthropic.APIConnectionError, asyncio.CancelledError):
+                        self._record(model, None)  # A request may have been billed before the connection was lost.
+                        raise
         reply.settings = {**settings, **({"cache": marks} if marks else {}), **({"batch": True} if batch else {})}
         reply.model, reply.model_id = model, spec["id"]
         return reply
@@ -449,8 +517,11 @@ class LLM:
         # The SDK dropped its sampling options; the models that still take them get them as extra fields.
         extra = {k: request.pop(k) for k in ("temperature", "top_p", "top_k") if k in request}
         extra.update(request.pop("extra_body", {}))
-        async with self.client("anthropic").messages.stream(**request, extra_body=extra) as stream:  # For long replies.
-            return self._anthropic_reply(model, await stream.get_final_message())
+        clock = Clock()
+        async with self.client("anthropic").messages.stream(**request, extra_body=extra) as stream:
+            async for _ in stream:
+                clock.tick()
+            return clock.stamp(self._anthropic_reply(model, await stream.get_final_message()))
 
     def _anthropic_reply(self, model, message, batch=False):
         spec = self.models[model]
@@ -508,7 +579,17 @@ class LLM:
         return request
 
     async def _openai(self, model, request):
-        return self._openai_reply(model, await self.client("openai").responses.create(**request))
+        """Streamed; the last event (completed, incomplete, or failed) carries the whole response."""
+        clock, response = Clock(), None
+        async for event in await self.client("openai").responses.create(**request, stream=True):
+            clock.tick()
+            if event.type == "error":
+                raise RuntimeError(f"OpenAI stream error: {getattr(event, 'message', event)}")
+            if event.type in ("response.completed", "response.incomplete", "response.failed"):
+                response = event.response
+        if response is None:
+            raise httpx2.RemoteProtocolError("OpenAI stream ended without a final response")
+        return clock.stamp(self._openai_reply(model, response))
 
     def _openai_reply(self, model, response, batch=False):
         spec = self.models[model]
@@ -570,6 +651,25 @@ class LLM:
                 "type": "function", "function": {"name": choice}}
         return request
 
+    async def _openrouter_stream(self, request):
+        """One streamed OpenRouter reply, put back together in the shape of an unstreamed one (as a dict), timed."""
+        clock, response, message, choice = Clock(), {}, {}, {}
+        stream = await self.client("openrouter").chat.completions.create(**request, stream=True,
+                                                                          stream_options={"include_usage": True})
+        async for chunk in stream:
+            clock.tick()
+            chunk = chunk.to_dict()
+            response.update({k: chunk[k] for k in ("id", "provider", "error", "usage") if chunk.get(k) is not None})
+            for part in chunk.get("choices") or []:
+                merge_delta(message, part.get("delta") or {})
+                if part.get("finish_reason"):
+                    choice["finish_reason"] = part["finish_reason"]
+                if (part.get("logprobs") or {}).get("content"):
+                    choice.setdefault("logprobs", []).extend(part["logprobs"]["content"])
+        if message or choice:
+            response["choices"] = [{**choice, "message": message}]
+        return response, clock
+
     async def _openrouter(self, model, request):
         """OpenRouter adds `reasoning`, and `reasoning_details`, which some models need sent back with their tool
         calls. A host error that arrives as a normal-looking response (no reply, or finish_reason "error") is retried
@@ -577,35 +677,37 @@ class LLM:
         spec, total = self.models[model], 0.0
         for attempt in range(self.max_retries + 1):
             try:
-                response = await self.client("openrouter").chat.completions.create(**request)
+                response, clock = await self._openrouter_stream(request)
             except openai.NotFoundError as e:  # OpenRouter's way of saying the pinned host can't take a setting.
                 if "No endpoints found that can handle the requested parameters" not in str(e):
                     raise
                 used = [k for k in request if k not in ("model", "messages", "max_tokens", "extra_body")]
                 used += [k for k in request["extra_body"] if k != "provider"]
                 raise ValueError(f"{spec['host']} doesn't take one of the settings sent: {', '.join(used)}") from e
-            host = getattr(response, "provider", None)
-            usage = response.usage.model_dump() if response.usage else {}
+            host = response.get("provider")
+            usage = response.get("usage") or {}
             cost = self._record(model, usage.get("cost"))
             total = None if total is None or cost is None else total + cost
-            if response.choices and response.choices[0].finish_reason != "error":
+            if response.get("choices") and response["choices"][0].get("finish_reason") not in ("error", None):
                 break
             if attempt == self.max_retries:
-                raise RuntimeError(f"No reply from {host} after {attempt + 1} tries: {getattr(response, 'error', None)}")
+                raise RuntimeError(f"No reply from {host} after {attempt + 1} tries: {response.get('error')}")
             await asyncio.sleep(2 ** attempt)
-        choice = response.choices[0]
-        text = choice.message.content or ""
-        tool_calls = [call.model_dump() for call in choice.message.tool_calls or []]
+        choice = response["choices"][0]
+        reply = choice["message"]
+        text = reply.get("content") or ""
+        tool_calls = [{k: v for k, v in call.items() if k != "index"} for call in reply.get("tool_calls") or []]
         message = {"role": "assistant", "content": text}
         if tool_calls:
             message["tool_calls"] = tool_calls
-        if details := getattr(choice.message, "reasoning_details", None):
+        if details := reply.get("reasoning_details"):
             message["reasoning_details"] = details
-        reasoning = getattr(choice.message, "reasoning", None) or ""
-        logprobs = [token.model_dump() for token in choice.logprobs.content or []] if choice.logprobs else []
-        stop = choice.finish_reason
-        return Reply(text, reasoning, tool_calls, message, STOP_REASONS["openrouter"].get(stop, "other"), stop,
-                     host, total, usage, shared_logprobs(logprobs) if logprobs else None, id=response.id)
+        reasoning = reply.get("reasoning") or ""
+        logprobs = choice.get("logprobs") or []
+        stop = choice["finish_reason"]
+        return clock.stamp(Reply(text, reasoning, tool_calls, message, STOP_REASONS["openrouter"].get(stop, "other"),
+                                 stop, host, total, usage, shared_logprobs(logprobs) if logprobs else None,
+                                 id=response.get("id", "")))
 
     async def _batched(self, api, model, request):
         """Queue a request, bounding both wait time and request count."""
