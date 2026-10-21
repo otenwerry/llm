@@ -92,6 +92,14 @@ class Clock:
         return reply
 
 
+def keep_partial(error, text, reasoning):
+    """Attach the text a reply had streamed before it failed or was canceled, as error.partial, for the caller."""
+    try:
+        error.partial = {"text": text, "reasoning": reasoning}
+    except AttributeError:  # Some built-in exceptions take no attributes.
+        pass
+
+
 # Keys a streamed delta repeats rather than extends, so they are replaced instead of joined.
 REPLACED_KEYS = ("id", "type", "index", "role", "name", "format", "signature")
 
@@ -525,8 +533,14 @@ class LLM:
         extra.update(request.pop("extra_body", {}))
         clock = Clock()
         async with self.client("anthropic").messages.stream(**request, extra_body=extra) as stream:
-            async for _ in stream:
-                clock.tick()
+            try:
+                async for _ in stream:
+                    clock.tick()
+            except BaseException as e:
+                blocks = getattr(getattr(stream, "current_message_snapshot", None), "content", None) or []
+                keep_partial(e, "".join(getattr(b, "text", "") for b in blocks),
+                             "".join(getattr(b, "thinking", "") for b in blocks))
+                raise
             return clock.stamp(self._anthropic_reply(model, await stream.get_final_message()))
 
     def _anthropic_reply(self, model, message, batch=False):
@@ -586,13 +600,21 @@ class LLM:
 
     async def _openai(self, model, request):
         """Streamed; the last event (completed, incomplete, or failed) carries the whole response."""
-        clock, response = Clock(), None
-        async for event in await self.client("openai").responses.create(**request, stream=True):
-            clock.tick()
-            if event.type == "error":
-                raise RuntimeError(f"OpenAI stream error: {getattr(event, 'message', event)}")
-            if event.type in ("response.completed", "response.incomplete", "response.failed"):
-                response = event.response
+        clock, response, text, reasoning = Clock(), None, [], []
+        try:
+            async for event in await self.client("openai").responses.create(**request, stream=True):
+                clock.tick()
+                if event.type == "response.output_text.delta":
+                    text.append(event.delta)
+                elif event.type == "response.reasoning_summary_text.delta":
+                    reasoning.append(event.delta)
+                elif event.type == "error":
+                    raise RuntimeError(f"OpenAI stream error: {getattr(event, 'message', event)}")
+                elif event.type in ("response.completed", "response.incomplete", "response.failed"):
+                    response = event.response
+        except BaseException as e:
+            keep_partial(e, "".join(text), "".join(reasoning))
+            raise
         if response is None:
             raise httpx2.RemoteProtocolError("OpenAI stream ended without a final response")
         return clock.stamp(self._openai_reply(model, response))
@@ -679,6 +701,9 @@ class LLM:
             # A host error after the stream began: the SDK raises it on OpenRouter's error chunk. It is retried like
             # an unstreamed reply with finish_reason "error"; no usage arrives, so its cost is unknown.
             response["error"], choice["finish_reason"] = e.body, "error"
+        except BaseException as e:
+            keep_partial(e, message.get("content") or "", message.get("reasoning") or "")
+            raise
         if message or choice:
             response["choices"] = [{**choice, "message": message}]
         return response, clock

@@ -486,3 +486,39 @@ def test_failed_attempts_are_recorded_and_reported_costs_kept(monkeypatch):
         assert reply.cost == pytest.approx(.24)  # This try and the one reported failure; unreported ones aren't guessed.
         assert llm.cost is None and llm.known_cost == pytest.approx(.24)  # The stall cut off its usage.
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('api', MODELS_BY_API)
+def test_partial_text_survives_cancellation(api):
+    async def run():
+        llm, client, _ = setup(api)
+        started = asyncio.Event()
+        async def slow():  # Streams some text, then hangs until canceled.
+            if api == 'openai':
+                yield NS(type='response.output_text.delta', delta='Hel')
+            elif api == 'openrouter':
+                yield NS(to_dict=lambda: {'id': 'gen', 'choices': [{'index': 0, 'delta': {'content': 'Hel', 'reasoning': 'r'}}]})
+            else:
+                yield NS(type='content_block_delta')
+            started.set()
+            await asyncio.Event().wait()
+        if api == 'anthropic':
+            class Stream:
+                current_message_snapshot = NS(content=[NS(type='text', text='Hel')])
+                def __aiter__(self):
+                    return slow().__aiter__()
+            @asynccontextmanager
+            async def stream(**kwargs):
+                yield Stream()
+            client.messages.stream = stream
+        else:
+            async def create(**kwargs):
+                return slow()
+            client.responses.create = client.chat.completions.create = create
+        task = asyncio.create_task(llm.ask(MODELS_BY_API[api], MESSAGES))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert caught.value.partial['text'] == 'Hel'
+    asyncio.run(run())
