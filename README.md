@@ -16,6 +16,18 @@ async with LLM() as llm:
 
 Set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `OPENROUTER_API_KEY` in the environment. Only keys for APIs you use are required. The library does **not** load `.env` files. If wanted, call `dotenv.load_dotenv()` in your application first.
 
+## When to cache (read this before building an experiment)
+
+Prompt caching is **off by default** for every Claude model and every other model whose spec says `caching = "paid"`. Turn it on whenever an experiment sends the same start of a prompt more than once: multi-turn conversations, several follow-ups sent after one shared conversation, or a long system prompt or document reused across many calls. Each call resends the whole conversation, so without caching every earlier turn is billed again at full input price. A cache read costs about a tenth of that (less on some models; see `price` in `llm/models.toml`), and a 5-minute cache write costs 1.25× input, so caching pays off as soon as a prefix is reused once. Don't cache one-off calls: the write premium is never paid back.
+
+Patterns:
+
+- **Turns sent one after another:** pass `cache=True` on every call. Each call writes the conversation so far, and the next turn reads it. Prefer this over putting `"cache": True` on stored messages, which pile up turn after turn (Claude allows at most 4 marks per request).
+- **Several calls branching from one shared conversation** (e.g. different follow-ups to the same history): put `"cache": True` on the last message of the shared part, not on the end of each prompt. Marking the end would pay the write premium on text no other call reuses. OpenAI can't mark an assistant message, so on OpenAI mark the user message before it. Send one branch first and wait for it before sending the rest; branches sent at the same moment can't read each other's cache.
+- **Models with `caching = "free"`** cache automatically; the library drops your marks, so marking is harmless. **Models with `caching = "none"`** raise an error if marked; check the spec when caching code may run on many models.
+
+Prompts below the provider's minimum length (roughly 512 to 4,096 tokens, depending on the model) are not cached even when marked. To check that caching works, look at `reply.usage`: `cache_read_input_tokens` on Claude, `input_tokens_details.cached_tokens` on OpenAI. Full rules are under "Prompt caching" below.
+
 ## Configuration
 
 Built-in aliases, prices, and routing live in `llm/models.toml`. Each `LLM` takes its own copy. Add or override complete model specs without editing the package:
@@ -67,7 +79,7 @@ Accounting happens before output parsing and delivery. A successful retried Open
 
 ## Prompt caching
 
-Specs label caching `free` (automatic), `paid` (explicit writes cost extra), or `none` (unsupported). This is provider prompt/KV caching, not saved responses: each call generates a fresh reply. Paid writes are opt-in.
+For when to turn caching on, see "When to cache" above. Specs label caching `free` (automatic), `paid` (explicit writes cost extra), or `none` (unsupported). This is provider prompt/KV caching, not saved responses: each call generates a fresh reply. Paid writes are opt-in.
 
 `cache=True` or `"5m"` marks the end of the prompt; a message's `"cache": True` marks a shared prefix. Anthropic also supports `"1h"`. Automatic caches ignore `True` and reject `False`/`"1h"`. Explicit OpenAI caches retain prompts for 30 minutes and reject assistant-message marks and `"1h"`. Actual hits depend on provider minimum lengths and expiration; inspect `reply.usage`.
 

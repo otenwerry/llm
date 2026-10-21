@@ -336,6 +336,8 @@ class LLM:
         """Return a Reply using shared settings (README.md). Unsupported settings raise ValueError.
         `extra_body` supplies provider-native options; `batch` overrides the instance default.
         Append reply.message to continue a conversation without losing provider reasoning state.
+        Prompt caching is off by default on most models: for multi-turn or branching experiments, read
+        README.md "When to cache" and pass `cache` / mark shared messages.
         """
         self._use_this_loop()
         if model not in self.models:
