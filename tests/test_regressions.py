@@ -460,3 +460,14 @@ def test_merge_delta_appends_entries_without_index():
     acc = merge_delta({}, {'reasoning_details': [{'type': 'a', 'text': 'x'}]})
     merge_delta(acc, {'reasoning_details': [{'type': 'b', 'text': 'y'}]})
     assert acc == {'reasoning_details': [{'type': 'a', 'text': 'x'}, {'type': 'b', 'text': 'y'}]}
+
+
+def test_openrouter_error_mid_stream_is_retried(monkeypatch):
+    import openai
+    monkeypatch.setattr('llm.api.asyncio.sleep', AsyncMock())
+    async def run():
+        error = openai.APIError('host failed', httpx.Request('POST', 'https://openrouter.ai'), body={'code': 502})
+        llm, _, call = setup('openrouter', [MidStream(raw=response('openrouter'), error=error), response('openrouter')])
+        reply = await llm.ask('qwen-3.7-plus', MESSAGES)
+        assert reply.text == 'ok' and call.await_count == 2 and reply.cost == llm.cost == .24  # Usage came before the error.
+    asyncio.run(run())

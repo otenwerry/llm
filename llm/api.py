@@ -656,16 +656,23 @@ class LLM:
         clock, response, message, choice = Clock(), {}, {}, {}
         stream = await self.client("openrouter").chat.completions.create(**request, stream=True,
                                                                           stream_options={"include_usage": True})
-        async for chunk in stream:
-            clock.tick()
-            chunk = chunk.to_dict()
-            response.update({k: chunk[k] for k in ("id", "provider", "error", "usage") if chunk.get(k) is not None})
-            for part in chunk.get("choices") or []:
-                merge_delta(message, part.get("delta") or {})
-                if part.get("finish_reason"):
-                    choice["finish_reason"] = part["finish_reason"]
-                if (part.get("logprobs") or {}).get("content"):
-                    choice.setdefault("logprobs", []).extend(part["logprobs"]["content"])
+        try:
+            async for chunk in stream:
+                clock.tick()
+                chunk = chunk.to_dict()
+                response.update({k: chunk[k] for k in ("id", "provider", "usage") if chunk.get(k) is not None})
+                for part in chunk.get("choices") or []:
+                    merge_delta(message, part.get("delta") or {})
+                    if part.get("finish_reason"):
+                        choice["finish_reason"] = part["finish_reason"]
+                    if (part.get("logprobs") or {}).get("content"):
+                        choice.setdefault("logprobs", []).extend(part["logprobs"]["content"])
+        except openai.APIError as e:
+            if isinstance(e, openai.APIStatusError):
+                raise
+            # A host error after the stream began: the SDK raises it on OpenRouter's error chunk. It is retried like
+            # an unstreamed reply with finish_reason "error"; no usage arrives, so its cost is unknown.
+            response["error"], choice["finish_reason"] = e.body, "error"
         if message or choice:
             response["choices"] = [{**choice, "message": message}]
         return response, clock
