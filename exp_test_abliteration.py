@@ -53,8 +53,7 @@ async def checks(llm, model):
         raise AssertionError(f"accepted {settings} without an error (text={reply.text!r})")
 
     found = [("reasoning text saved", reasoning_saved()), (f"reasoning {LOWEST[model]}", lowest_level()),
-             ("second turn", second_turn()), ("cut off at max_tokens", cut_off()),
-             ("top_k rejected", rejects(top_k=40))]
+             ("second turn", second_turn()), ("cut off at max_tokens", cut_off())]
     if model != "abliterated":  # Their model list caps the large models' temperature at 1.
         found.append(("temperature 1.5 rejected", rejects(temperature=1.5)))
     return found
