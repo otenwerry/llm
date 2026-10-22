@@ -4,6 +4,17 @@
 Unified interface to call models through OpenAI/Anthropic/OpenRouter APIs. Work in progress, probably not good to use in arbitrary projects yet but works well enough for what I'm working on now; will make a bit better later on
 
 [LLM-written]
+
+## What this package is for
+
+It does five things that calling the Anthropic, OpenAI, and OpenRouter APIs directly does not:
+
+1. **One conversation format for every model.** Messages are written in OpenAI's chat format and translated for each API. In multi-turn conversations, Claude's thinking blocks and OpenAI's encrypted reasoning are sent back exactly as they came, so models keep their earlier reasoning.
+2. **A dollar cost on every reply.** Anthropic and OpenAI report only token counts; the package prices them from `llm/models.toml`, including cache, long-prompt, and batch prices. A cost it can't work out is `None`, never zero.
+3. **OpenRouter pinned to one host.** Each OpenRouter model goes only to the host named in `llm/models.toml`, with no fallback to another host.
+4. **Recovery from stalled or broken replies.** Replies stream; if nothing arrives for `idle_timeout` seconds or the connection drops, the request is sent again. If every try fails, the text received so far is kept on the error as `error.partial`.
+5. **No silently ignored settings.** A setting a model can't take raises an error. Anthropic and OpenAI already reject these; OpenRouter by default drops them without saying so, and the package turns that off (`require_parameters`).
+
 Install this directory as a local dependency (`uv add --editable /path/to/llm`) or install its built wheel.
 
 ```python
@@ -14,7 +25,7 @@ async with LLM() as llm:
     print(reply.text, reply.cost)
 ```
 
-Set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `OPENROUTER_API_KEY` in the environment. Only keys for APIs you use are required. The library does **not** load `.env` files. If wanted, call `dotenv.load_dotenv()` in your application first.
+Set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, or `ABLITERATION_API_KEY` in the environment. Only keys for APIs you use are required. The library does **not** load `.env` files. If wanted, call `dotenv.load_dotenv()` in your application first.
 
 ## When to cache (read this before building an experiment)
 
@@ -43,7 +54,7 @@ A spec needs `api`, `id`, `max_tokens`, and `caching`; OpenRouter also needs `ho
 
 `LLM(clients={"openai": custom_async_openai_client})` supports your own credentials, endpoint, headers, transport, and SDK configuration. Injected clients remain owned by you. Owned clients close with `async with LLM()` or `await llm.aclose()`. Use one instance per event loop.
 
-`LLM(timeout=3600, idle_timeout=120, max_retries=5, concurrency=50)` configures owned clients and simultaneous calls per API. Replies stream from every API, so a stalled request is caught quickly: if no data at all arrives for `idle_timeout` seconds, or the connection drops mid-reply, the request is sent again (up to `max_retries` times, printing a line each time), and the abandoned try's cost counts as unknown. `timeout` covers connecting and sending. Injected clients retain their own SDK retry/timeout settings. Defaults route Claude/GPT directly and pin OpenRouter to one host; override the model spec or native provider options to change routing.
+`LLM(timeout=3600, idle_timeout=120, max_retries=5, concurrency=50)` configures owned clients and simultaneous calls per API. Replies stream from every API, so a stalled request is caught quickly: if no data at all arrives for `idle_timeout` seconds, or the connection drops mid-reply, the request is sent again (up to `max_retries` times, printing a line each time), and the abandoned try's cost counts as unknown. `timeout` covers connecting and sending. Injected clients retain their own SDK retry/timeout settings. Defaults route Claude/GPT and abliteration.ai's abliterated models directly and pin OpenRouter to one host; override the model spec or native provider options to change routing.
 
 ## Messages and settings
 
@@ -53,7 +64,7 @@ Messages and function tools use OpenAI chat format. Content accepts strings and 
 |---|---|
 | `max_tokens` | Positive output limit, reasoning included. Defaults to the configured model limit; reduce it when prompt plus output would exceed context. |
 | `temperature`, `top_p`, `top_k` | Sampling controls where supported. |
-| `seed`, `frequency_penalty`, `presence_penalty` | OpenRouter only. |
+| `seed`, `frequency_penalty`, `presence_penalty` | OpenRouter and abliteration.ai only. |
 | `reasoning` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; support varies by model/API. Omission preserves provider defaults. |
 | `verbosity` | `low`, `medium`, or `high`, for OpenAI/OpenRouter. |
 | `stop` | Stop strings, for Anthropic/OpenRouter. |
@@ -69,9 +80,9 @@ Unsupported shared options raise errors locally or at the provider. `extra_body`
 
 ## Replies and costs
 
-`Reply` includes `text`, `reasoning`, `tool_calls`, `message`, `stop_reason`, `api_stop_reason`, `host`, `usage`, `cost`, `logprobs`, `settings`, `model`, `model_id`, provider response `id`, `seconds` (how long the reply took), and `longest_gap` (the longest wait between streamed events, for choosing `idle_timeout`; both are None for batches), and `failed_attempts`: every try before the one that worked, each `{"error", "cost"}`. Each retry also prints one line. `reply.cost` includes the failed tries whose cost the provider reported; a try with no reported cost has `cost: None` there and makes `llm.cost` unknown, but is not guessed into `reply.cost`. Usage preserves provider fields. Stop reasons normalize to `end`, `tool_calls`, `max_tokens`, `refusal`, `content_filter`, or `other`. OpenAI status `failed` raises an error.
+`Reply` includes `text`, `reasoning`, `tool_calls`, `message`, `stop_reason`, `api_stop_reason`, `host`, `usage`, `cost`, `logprobs`, `settings`, `model`, `model_id`, provider response `id`, `seconds` (how long the reply took), and `longest_gap` (the longest wait between streamed events, for choosing `idle_timeout`; both are None for batches), and `failed_attempts`: every try before the one that worked, each `{"error", "cost"}`. Each retry also prints one line. `reply.cost` includes the failed tries whose cost the provider reported; a try with no reported cost has `cost: None` there and makes `llm.cost` unknown, but is not guessed into `reply.cost`. Usage preserves provider fields. abliteration.ai's safety policies reject a request with `openai.PermissionDeniedError` (code `policy_violation`), or cut off a reply mid-stream with an `openai.APIError` of the same code; neither is retried. Stop reasons normalize to `end`, `tool_calls`, `max_tokens`, `refusal`, `content_filter`, or `other`. OpenAI status `failed` raises an error.
 
-OpenRouter cost comes from reported usage. Direct cost is an **estimate** from usage and configured prices, including cache reads/writes, long prompts, and batch discounts. Keep prices current. Premium tiers and server tools are unpriced unless the estimator covers them; a spec's `service_tier` can identify the tier its prices apply to.
+OpenRouter cost comes from reported usage. Direct cost (abliteration.ai included) is an **estimate** from usage and configured prices, including cache reads/writes, long prompts, and batch discounts. Keep prices current. Premium tiers and server tools are unpriced unless the estimator covers them; a spec's `service_tier` can identify the tier its prices apply to.
 
 **Unknown cost is `None`, never zero.** Missing usage/prices, unpriced features, or an interrupted request can make totals unknown. `llm.cost` and `llm.costs[model]` include observed charges from failed attempts and canceled callers whose batch results were retrieved. They become `None` when any recorded charge is unknown. `llm.known_cost` remains the subtotal of known charges. Check for `None` before summing or formatting costs.
 
@@ -87,7 +98,7 @@ For when to turn caching on, see "When to cache" above. Specs label caching `fre
 
 ## Batches and checks
 
-`LLM(batch=True)` uses Anthropic/OpenAI batch APIs; OpenRouter rejects it. Start calls concurrently with `asyncio.gather`. Queues flush within two seconds or at 10,000 requests; replies can take hours. Settings and accounting work the same, with the configured batch discount.
+`LLM(batch=True)` uses Anthropic/OpenAI batch APIs; OpenRouter and abliteration.ai reject it. Start calls concurrently with `asyncio.gather`. Queues flush within two seconds or at 10,000 requests; replies can take hours. Settings and accounting work the same, with the configured batch discount.
 
 Canceling a queued call prevents submission. Canceling a submitted caller does not cancel the remote request or discard other results. Closing stops local polling; remote work may continue and be billed. Batch IDs are printed; automatic recovery is not implemented. Finish active work before closing if you need all results.
 

@@ -1,5 +1,5 @@
 # Every model experiments can call, by nickname. See README.md.
-#   api          where requests go: "anthropic" or "openai" (direct), or "openrouter"
+#   api          where requests go: "anthropic", "openai", or "abliteration" (direct), or "openrouter"
 #   id           the model's name on that API
 #   max_tokens   the longest reply allowed; every request asks for this much unless told otherwise
 #   thinks       true for Claude models that think even when not asked to, so their thinking is always shown
@@ -18,6 +18,7 @@
 #   Prices last checked 2026-10-02 against
 #     https://platform.claude.com/docs/en/about-claude/pricing
 #     https://developers.openai.com/api/docs/pricing
+#     https://docs.abliteration.ai/pricing (or GET https://api.abliteration.ai/v1/models, which lists them per token)
 #   OpenRouter hosts and output limits: run `await LLM().check(list(MODELS))` (free) and see
 #     https://openrouter.ai/<model id>/providers
 #   Don't take Anthropic or OpenAI prices from OpenRouter.
@@ -296,3 +297,28 @@ id = "meta-llama/llama-4-maverick"
 caching = "free"
 host = "digitalocean"
 max_tokens = 16_384
+
+# abliteration.ai: open-weight models with refusal behavior removed ("abliterated"), served directly. They cache
+# automatically; a cache write costs the normal input price. The API reports no cost, so it is computed from these
+# prices. Checked 2026-10-22.
+
+["abliterated"]
+api = "abliteration"
+id = "abliterated-model"  # Base model not published
+caching = "free"
+max_tokens = 262_134
+price = { input = 1.00, output = 3.00, cache_read = 0.10, cache_write = 1.00 }
+
+["abliterated-large-v2"]
+api = "abliteration"
+id = "abliterated-model-large-v2"  # GLM 5.3. Reasoning "none" runs at low with the reasoning hidden.
+caching = "free"
+max_tokens = 999_990
+price = { input = 3.00, output = 5.00, cache_read = 0.30, cache_write = 3.00 }
+
+["abliterated-large"]
+api = "abliteration"
+id = "abliterated-model-large"  # GLM 5.2
+caching = "free"
+max_tokens = 999_990
+price = { input = 3.00, output = 5.00, cache_read = 0.30, cache_write = 3.00 }

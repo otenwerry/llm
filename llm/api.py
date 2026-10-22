@@ -1,5 +1,5 @@
-"""Call models by configurable nickname. Defaults send Claude to Anthropic, GPT to OpenAI, and
-everything else through OpenRouter, pinned to one host. Every reply records its dollar cost and who served it.
+"""Call models by configurable nickname. Defaults send Claude to Anthropic, GPT to OpenAI, abliterated models to
+abliteration.ai, and everything else through OpenRouter, pinned to one host. Every reply records its dollar cost and who served it.
 
 Conversations use OpenAI's chat format everywhere (see README.md); this file translates it for Anthropic. Settings
 have one shared name each, translated for every API; a setting a model can't take raises ValueError."""
@@ -26,16 +26,23 @@ CONCURRENCY = 50  # Requests in flight at once per API, unless LLM(concurrency=.
 NATIVE_KEYS = ("anthropic_content", "openai_output")  # Provider-specific copies kept on assistant messages.
 CACHE_TIMES = {True: "5m", "5m": "5m", "1h": "1h"}  # Accepted cache marks, and how long each keeps the text.
 PING = [{"role": "user", "content": "Reply with only the word: ok"}]
-KEYS = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "openrouter": "OPENROUTER_API_KEY"}
+KEYS = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "openrouter": "OPENROUTER_API_KEY",
+        "abliteration": "ABLITERATION_API_KEY"}
+BASE_URLS = {"openrouter": "https://openrouter.ai/api/v1", "abliteration": "https://api.abliteration.ai/v1"}
+# Error codes that end a chat reply for good: retrying the same input gets the same answer. abliteration.ai's safety
+# policies send "policy_violation", before the reply (HTTP 403) or in place of the rest of it (a stream error).
+FINAL_CODES = ("policy_violation",)
 UNSUPPORTED = {  # Shared settings each API has no way to take.
     "anthropic": {"seed", "frequency_penalty", "presence_penalty", "verbosity", "logprobs"},
     "openai": {"top_k", "seed", "frequency_penalty", "presence_penalty", "stop"},
     "openrouter": set(),
+    "abliteration": set(),
 }
 REASONING = {  # Reasoning levels each API takes, from least to most.
     "anthropic": ("none", "low", "medium", "high", "xhigh", "max"),
     "openai": ("none", "minimal", "low", "medium", "high", "xhigh", "max"),
     "openrouter": ("none", "minimal", "low", "medium", "high", "xhigh"),
+    "abliteration": ("none", "minimal", "low", "medium", "high", "xhigh", "max"),
 }
 VERBOSITY = ("low", "medium", "high")
 STOP_REASONS = {  # Each API's stop reasons in shared terms; anything unlisted becomes "other".
@@ -45,7 +52,8 @@ STOP_REASONS = {  # Each API's stop reasons in shared terms; anything unlisted b
     "openrouter": {"stop": "end", "tool_calls": "tool_calls", "length": "max_tokens",
                    "content_filter": "content_filter"},
 }
-BATCH_APIS = ("anthropic", "openai")  # OpenRouter has no batch API.
+STOP_REASONS["abliteration"] = STOP_REASONS["openrouter"]
+BATCH_APIS = ("anthropic", "openai")  # OpenRouter and abliteration.ai have no batch API.
 BATCH_PRICE = 0.5  # Both batch APIs charge half of every price, cache reads and writes included (checked 2026-10-05).
 BATCH_WAIT = 2  # Maximum seconds before queued requests are sent as a batch.
 BATCH_POLL = 30  # Seconds between checks on a running batch.
@@ -268,8 +276,8 @@ def openai_input(messages):
 
 
 def openrouter_messages(messages):
-    """OpenAI-format messages for OpenRouter: Claude- and OpenAI-only copies dropped, and cache marks written the
-    way OpenRouter passes them on to hosts that need them."""
+    """OpenAI-format messages for OpenRouter or abliteration.ai: Claude- and OpenAI-only copies dropped, and cache
+    marks written the way OpenRouter passes them on to hosts that need them."""
     out = []
     for m in messages:
         cache = m.get("cache")
@@ -282,6 +290,11 @@ def openrouter_messages(messages):
             m["content"] = parts
         out.append(m)
     return out
+
+def reasoning_of(message):
+    """A Chat Completions message's reasoning: OpenRouter calls it `reasoning`, abliteration.ai `reasoning_content`."""
+    return message.get("reasoning") or message.get("reasoning_content") or ""
+
 
 def shared_logprobs(tokens):
     """Logprobs from OpenAI or OpenRouter, which report them the same way, without the raw bytes."""
@@ -364,7 +377,7 @@ class LLM:
             settings = {"api_key": os.environ[KEYS[api]], "max_retries": self.max_retries,
                         "timeout": httpx2.Timeout(self.timeout, read=self.idle_timeout)}
             self.clients[api] = (anthropic.AsyncAnthropic(**settings) if api == "anthropic" else openai.AsyncOpenAI(
-                **settings, **({"base_url": "https://openrouter.ai/api/v1"} if api == "openrouter" else {})))
+                **settings, **({"base_url": BASE_URLS[api]} if api in BASE_URLS else {})))
             self.owned.add(api)
         return self.clients[api]
 
@@ -655,9 +668,22 @@ class LLM:
 
     def _openrouter_request(self, spec, messages, tools, settings):
         """Pinned to one host, with no fallback and no host that would ignore a setting."""
-        extra = {"provider": {"only": [spec["host"]], "allow_fallbacks": False, "require_parameters": True}}
+        request = self._chat_request(spec, messages, tools, settings)
+        request["extra_body"]["provider"] = {"only": [spec["host"]], "allow_fallbacks": False,
+                                             "require_parameters": True}
         if "reasoning" in settings:
-            extra["reasoning"] = {"effort": settings["reasoning"]}
+            request["extra_body"]["reasoning"] = {"effort": settings["reasoning"]}
+        return request
+
+    def _abliteration_request(self, spec, messages, tools, settings):
+        request = self._chat_request(spec, messages, tools, settings)
+        if "reasoning" in settings:
+            request["extra_body"]["reasoning_effort"] = settings["reasoning"]
+        return request
+
+    def _chat_request(self, spec, messages, tools, settings):
+        """A Chat Completions request, as OpenRouter and abliteration.ai both take it."""
+        extra = {}
         for name in ("top_k", "verbosity"):
             if name in settings:
                 extra[name] = settings[name]
@@ -679,11 +705,12 @@ class LLM:
                 "type": "function", "function": {"name": choice}}
         return request
 
-    async def _openrouter_stream(self, request):
-        """One streamed OpenRouter reply, put back together in the shape of an unstreamed one (as a dict), timed."""
+    async def _chat_stream(self, api, request):
+        """One streamed Chat Completions reply, put back together in the shape of an unstreamed one (as a dict),
+        timed."""
         clock, response, message, choice = Clock(), {}, {}, {}
-        stream = await self.client("openrouter").chat.completions.create(**request, stream=True,
-                                                                          stream_options={"include_usage": True})
+        stream = await self.client(api).chat.completions.create(**request, stream=True,
+                                                                stream_options={"include_usage": True})
         try:
             async for chunk in stream:
                 clock.tick()
@@ -696,35 +723,44 @@ class LLM:
                     if (part.get("logprobs") or {}).get("content"):
                         choice.setdefault("logprobs", []).extend(part["logprobs"]["content"])
         except openai.APIError as e:
-            if isinstance(e, openai.APIStatusError):
+            if isinstance(e, openai.APIStatusError) or e.code in FINAL_CODES:
+                keep_partial(e, message.get("content") or "", reasoning_of(message))
                 raise
             # A host error after the stream began: the SDK raises it on OpenRouter's error chunk. It is retried like
             # an unstreamed reply with finish_reason "error"; no usage arrives, so its cost is unknown.
             response["error"], choice["finish_reason"] = e.body, "error"
         except BaseException as e:
-            keep_partial(e, message.get("content") or "", message.get("reasoning") or "")
+            keep_partial(e, message.get("content") or "", reasoning_of(message))
             raise
         if message or choice:
             response["choices"] = [{**choice, "message": message}]
         return response, clock
 
-    async def _openrouter(self, model, request):
-        """OpenRouter adds `reasoning`, and `reasoning_details`, which some models need sent back with their tool
-        calls. A host error that arrives as a normal-looking response (no reply, or finish_reason "error") is retried
-        like any other temporary error, and whatever the failed tries cost is added to the reply's cost."""
+    async def _chat(self, model, request):
+        """A reply from OpenRouter or abliteration.ai. OpenRouter adds `reasoning`, and `reasoning_details`, which
+        some models need sent back with their tool calls; abliteration.ai sends `reasoning_content`. A host error that
+        arrives as a normal-looking response (no reply, or finish_reason "error") is retried like any other temporary
+        error, and whatever the failed tries cost is added to the reply's cost."""
         spec, failed = self.models[model], []
+        api = spec["api"]
         for attempt in range(self.max_retries + 1):
             try:
-                response, clock = await self._openrouter_stream(request)
+                response, clock = await self._chat_stream(api, request)
             except openai.NotFoundError as e:  # OpenRouter's way of saying the pinned host can't take a setting.
                 if "No endpoints found that can handle the requested parameters" not in str(e):
                     raise
                 used = [k for k in request if k not in ("model", "messages", "max_tokens", "extra_body")]
                 used += [k for k in request["extra_body"] if k != "provider"]
                 raise ValueError(f"{spec['host']} doesn't take one of the settings sent: {', '.join(used)}") from e
-            host = response.get("provider")
             usage = response.get("usage") or {}
-            cost = self._record(model, usage.get("cost"))
+            if api == "openrouter":
+                host, cost = response.get("provider"), usage.get("cost")
+            else:  # abliteration.ai reports tokens but no cost. Its cache writes cost the normal input price.
+                cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+                host = "abliteration.ai"
+                cost = price(spec, usage["prompt_tokens"] - cached, cached, 0, usage["completion_tokens"]) \
+                    if "prompt_tokens" in usage and "completion_tokens" in usage else None
+            cost = self._record(model, cost)
             if response.get("choices") and response["choices"][0].get("finish_reason") not in ("error", None):
                 break
             error = response.get("error") or "the reply ended without a finish reason"
@@ -744,12 +780,14 @@ class LLM:
             message["tool_calls"] = tool_calls
         if details := reply.get("reasoning_details"):
             message["reasoning_details"] = details
-        reasoning = reply.get("reasoning") or ""
+        reasoning = reasoning_of(reply)
         logprobs = choice.get("logprobs") or []
         stop = choice["finish_reason"]
-        return clock.stamp(Reply(text, reasoning, tool_calls, message, STOP_REASONS["openrouter"].get(stop, "other"),
+        return clock.stamp(Reply(text, reasoning, tool_calls, message, STOP_REASONS[api].get(stop, "other"),
                                  stop, host, total, usage, shared_logprobs(logprobs) if logprobs else None,
                                  id=response.get("id", ""), failed_attempts=failed))
+
+    _openrouter = _abliteration = _chat
 
     async def _batched(self, api, model, request):
         """Queue a request, bounding both wait time and request count."""

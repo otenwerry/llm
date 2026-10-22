@@ -14,7 +14,7 @@ from openai.types.responses import Response
 from llm import LLM, MODELS
 from llm.api import IDLE_TIMEOUT, anthropic_messages, merge_delta, openai_parts, price
 
-MODELS_BY_API = {'anthropic': 'opus-4.6', 'openai': 'gpt-5.5', 'openrouter': 'qwen-3.7-plus'}
+MODELS_BY_API = {'anthropic': 'opus-4.6', 'openai': 'gpt-5.5', 'openrouter': 'qwen-3.7-plus', 'abliteration': 'abliterated'}
 MESSAGES = [{'role': 'user', 'content': 'hi'}]
 TOOL = {'type': 'function', 'function': {'name': 'weather', 'strict': True, 'parameters': {'type': 'object'}}}
 
@@ -496,7 +496,7 @@ def test_partial_text_survives_cancellation(api):
         async def slow():  # Streams some text, then hangs until canceled.
             if api == 'openai':
                 yield NS(type='response.output_text.delta', delta='Hel')
-            elif api == 'openrouter':
+            elif api in ('openrouter', 'abliteration'):
                 yield NS(to_dict=lambda: {'id': 'gen', 'choices': [{'index': 0, 'delta': {'content': 'Hel', 'reasoning': 'r'}}]})
             else:
                 yield NS(type='content_block_delta')
@@ -521,4 +521,41 @@ def test_partial_text_survives_cancellation(api):
         with pytest.raises(asyncio.CancelledError) as caught:
             await task
         assert caught.value.partial['text'] == 'Hel'
+    asyncio.run(run())
+
+
+def test_abliteration_reasoning_cost_and_request(monkeypatch):
+    async def run():
+        chunks = [
+            {'id': 'chatcmpl', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'reasoning_content': 'thi'}}]},
+            {'id': 'chatcmpl', 'choices': [{'index': 0, 'delta': {'reasoning_content': 'nk', 'content': 'ok'},
+                                            'finish_reason': 'stop'}]},
+            {'id': 'chatcmpl', 'choices': [], 'usage': {'prompt_tokens': 1_000_000, 'completion_tokens': 1_000_000,
+                                                        'prompt_tokens_details': {'cached_tokens': 500_000}}},
+        ]
+        llm, client, _ = setup('abliteration')
+        sent = {}
+        async def create(**kwargs):
+            sent.update(kwargs)
+            return events([NS(to_dict=lambda c=c: c) for c in chunks])
+        client.chat.completions.create = create
+        reply = await llm.ask('abliterated-large-v2', MESSAGES, reasoning='max', temperature=0)
+        assert sent['model'] == 'abliterated-model-large-v2' and sent['temperature'] == 0
+        assert sent['extra_body'] == {'reasoning_effort': 'max'}  # No OpenRouter host pinning.
+        assert reply.text == 'ok' and reply.reasoning == 'think' and reply.host == 'abliteration.ai'
+        assert reply.stop_reason == 'end' and reply.message == {'role': 'assistant', 'content': 'ok'}
+        assert reply.cost == llm.cost == pytest.approx(1.5 + .15 + 5)  # Uncached input, cached input, output.
+    asyncio.run(run())
+
+
+def test_abliteration_policy_block_is_not_retried(monkeypatch):
+    import openai
+    monkeypatch.setattr('llm.api.asyncio.sleep', AsyncMock())
+    async def run():
+        error = openai.APIError('blocked', httpx.Request('POST', 'https://api.abliteration.ai'),
+                                body={'type': 'policy_error', 'code': 'policy_violation'})
+        llm, _, call = setup('abliteration', [MidStream(raw=response('openrouter'), error=error), response('openrouter')])
+        with pytest.raises(openai.APIError) as caught:
+            await llm.ask('abliterated', MESSAGES)
+        assert caught.value.code == 'policy_violation' and call.await_count == 1
     asyncio.run(run())
