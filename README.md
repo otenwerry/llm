@@ -50,7 +50,7 @@ llm = LLM(models={"custom": {
 }})
 ```
 
-A spec needs `api`, `id`, `max_tokens`, and `caching`; OpenRouter also needs `host`. Set `reasoning=False` for OpenAI models without reasoning support, or `temperature=False` to reject that setting. Anthropic's `thinks=True` requests a summary of default thinking. See the bundled table for pricing fields; missing prices produce an unknown cost.
+A spec needs `api`, `id`, `max_tokens`, and `caching`; OpenRouter also needs `host`. Set `reasoning=False` for OpenAI models without reasoning support, `reasoning_off=False` for models that can't stop reasoning (reasoning `none` then raises an error), or `temperature=False` to reject that setting. Anthropic's `thinks=True` requests a summary of default thinking. See the bundled table for pricing fields; missing prices produce an unknown cost.
 
 `LLM(clients={"openai": custom_async_openai_client})` supports your own credentials, endpoint, headers, transport, and SDK configuration. Injected clients remain owned by you. Owned clients close with `async with LLM()` or `await llm.aclose()`. Use one instance per event loop.
 

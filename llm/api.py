@@ -447,6 +447,8 @@ class LLM:
             raise ValueError(f"{model} takes reasoning {', '.join(REASONING[api])}, not {reasoning!r}")
         if "reasoning" in settings and not spec.get("reasoning", True):
             raise ValueError(f"{model} does not support reasoning controls")
+        if reasoning == "none" and not spec.get("reasoning_off", True):
+            raise ValueError(f"{model} can't turn its reasoning off; its API would quietly run it at low instead")
         if "verbosity" in settings and verbosity not in VERBOSITY:
             raise ValueError(f"verbosity must be {', '.join(VERBOSITY)}, not {verbosity!r}")
         if not tools and {"tool_choice", "parallel_tool_calls"} & set(settings):

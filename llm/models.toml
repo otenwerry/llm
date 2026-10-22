@@ -6,6 +6,8 @@
 #                (asking to see it would make other Claude models think)
 #   temperature  false if the API rejects a temperature setting (asking for one then raises an error; the model
 #                runs at 1, see README.md)
+#   reasoning_off false if the model can't stop reasoning (asking for reasoning "none" then raises an error, rather
+#                than letting the API quietly run it at a low level)
 #   price        dollars per million tokens, for direct APIs (OpenRouter reports each call's cost itself);
 #                cache_write is a 5-minute cache write, cache_write_1h a 1-hour one (Anthropic only)
 #   long_price   prices used instead when a prompt is over `above` tokens (OpenAI only; Anthropic has no surcharge)
@@ -311,8 +313,9 @@ price = { input = 1.00, output = 3.00, cache_read = 0.10, cache_write = 1.00 }
 
 ["abliterated-large-v2"]
 api = "abliteration"
-id = "abliterated-model-large-v2"  # GLM 5.3. Reasoning "none" runs at low with the reasoning hidden.
+id = "abliterated-model-large-v2"  # GLM 5.3
 caching = "free"
+reasoning_off = false  # The API would run reasoning "none" at low, with the reasoning hidden.
 max_tokens = 999_990
 price = { input = 3.00, output = 5.00, cache_read = 0.30, cache_write = 3.00 }
 

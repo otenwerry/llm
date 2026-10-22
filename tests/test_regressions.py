@@ -548,6 +548,16 @@ def test_abliteration_reasoning_cost_and_request(monkeypatch):
     asyncio.run(run())
 
 
+def test_reasoning_none_rejected_where_it_cant_be_turned_off():
+    async def run():
+        llm, _, call = setup('abliteration')
+        with pytest.raises(ValueError, match="can't turn its reasoning off"):
+            await llm.ask('abliterated-large-v2', MESSAGES, reasoning='none')
+        await llm.ask('abliterated-large', MESSAGES, reasoning='none')  # The older large model can.
+        assert call.call_args.kwargs['extra_body'] == {'reasoning_effort': 'none'} and call.await_count == 1
+    asyncio.run(run())
+
+
 def test_abliteration_policy_block_is_not_retried(monkeypatch):
     import openai
     monkeypatch.setattr('llm.api.asyncio.sleep', AsyncMock())
