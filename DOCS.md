@@ -9,3 +9,9 @@ uv run exp_test.py
     [--batch]
     [--dry-run]
 --> prints PASS / FAIL per model and cost totals; exits unsuccessfully on failures
+
+## Paid abliteration.ai checks
+uv run exp_test_abliteration.py
+    [--models abliterated-large-v2,abliterated-large,abliterated]
+    [--dry-run]
+--> prints PASS / FAIL per model and check, our cost next to abliteration.ai's billed amount; exits unsuccessfully on failures
