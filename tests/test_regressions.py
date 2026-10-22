@@ -548,13 +548,17 @@ def test_abliteration_reasoning_cost_and_request(monkeypatch):
     asyncio.run(run())
 
 
-def test_reasoning_none_rejected_where_it_cant_be_turned_off():
+def test_only_real_reasoning_levels_are_accepted():
     async def run():
-        llm, _, call = setup('abliteration')
-        with pytest.raises(ValueError, match="can't turn its reasoning off"):
-            await llm.ask('abliterated-large-v2', MESSAGES, reasoning='none')
-        await llm.ask('abliterated-large', MESSAGES, reasoning='none')  # The older large model can.
-        assert call.call_args.kwargs['extra_body'] == {'reasoning_effort': 'none'} and call.await_count == 1
+        llm, _, call = setup('abliteration', [response('abliteration') for _ in range(3)])
+        for model, level in [('abliterated-large-v2', 'none'), ('abliterated-large-v2', 'medium'),
+                             ('abliterated-large', 'low'), ('abliterated-large', 'xhigh')]:
+            with pytest.raises(ValueError, match='takes reasoning'):
+                await llm.ask(model, MESSAGES, reasoning=level)
+        await llm.ask('abliterated-large-v2', MESSAGES, reasoning='high')
+        await llm.ask('abliterated-large', MESSAGES, reasoning='none')
+        await llm.ask('abliterated', MESSAGES, reasoning='medium')  # The base model has every level.
+        assert call.call_args.kwargs['extra_body'] == {'reasoning_effort': 'medium'} and call.await_count == 3
     asyncio.run(run())
 
 

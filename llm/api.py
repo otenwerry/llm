@@ -443,12 +443,11 @@ class LLM:
             raise ValueError(f"{model} can't take {', '.join(unsupported)}; {api}'s API has no such setting")
         if "temperature" in settings and not spec.get("temperature", True):
             raise ValueError(f"{model} doesn't take a temperature setting; its API rejects one")
-        if "reasoning" in settings and reasoning not in REASONING[api]:
-            raise ValueError(f"{model} takes reasoning {', '.join(REASONING[api])}, not {reasoning!r}")
+        levels = spec.get("reasoning_levels", REASONING[api])
+        if "reasoning" in settings and reasoning not in levels:
+            raise ValueError(f"{model} takes reasoning {', '.join(levels)}, not {reasoning!r}")
         if "reasoning" in settings and not spec.get("reasoning", True):
             raise ValueError(f"{model} does not support reasoning controls")
-        if reasoning == "none" and not spec.get("reasoning_off", True):
-            raise ValueError(f"{model} can't turn its reasoning off; its API would quietly run it at low instead")
         if "verbosity" in settings and verbosity not in VERBOSITY:
             raise ValueError(f"verbosity must be {', '.join(VERBOSITY)}, not {verbosity!r}")
         if not tools and {"tool_choice", "parallel_tool_calls"} & set(settings):
