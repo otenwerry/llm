@@ -275,7 +275,7 @@ def openai_input(messages):
     return items
 
 
-def openrouter_messages(messages):
+def chat_messages(messages):
     """OpenAI-format messages for OpenRouter or abliteration.ai: Claude- and OpenAI-only copies dropped, and cache
     marks written the way OpenRouter passes them on to hosts that need them."""
     out = []
@@ -688,7 +688,7 @@ class LLM:
         for name in ("top_k", "verbosity"):
             if name in settings:
                 extra[name] = settings[name]
-        request = {"model": spec["id"], "messages": openrouter_messages(messages),
+        request = {"model": spec["id"], "messages": chat_messages(messages),
                    "max_tokens": settings["max_tokens"], "extra_body": extra}
         if tools:
             request["tools"] = tools

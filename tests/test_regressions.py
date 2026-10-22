@@ -524,7 +524,7 @@ def test_partial_text_survives_cancellation(api):
     asyncio.run(run())
 
 
-def test_abliteration_reasoning_cost_and_request(monkeypatch):
+def test_abliteration_reasoning_cost_and_request():
     async def run():
         chunks = [
             {'id': 'chatcmpl', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'reasoning_content': 'thi'}}]},
