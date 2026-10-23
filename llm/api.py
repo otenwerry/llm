@@ -23,6 +23,9 @@ TIMEOUT = 3600  # Seconds to connect, send, or wait for a free connection; repli
 # records the longest wait each reply actually had.
 IDLE_TIMEOUT = 120
 CONCURRENCY = 50  # Requests in flight at once per API, unless LLM(concurrency=...) says otherwise.
+# Lower caps for APIs whose account limits allow fewer at once. abliteration.ai allows 12 per key at our Tier 2
+# (Tier 3: 16, Tier 4-5: 32; https://docs.abliteration.ai/api/rate-limits.md). Raise this when the tier goes up.
+API_CONCURRENCY = {"abliteration": 12}
 NATIVE_KEYS = ("anthropic_content", "openai_output")  # Provider-specific copies kept on assistant messages.
 CACHE_TIMES = {True: "5m", "5m": "5m", "1h": "1h"}  # Accepted cache marks, and how long each keeps the text.
 PING = [{"role": "user", "content": "Reply with only the word: ok"}]
@@ -333,7 +336,8 @@ class LLM:
             raise RuntimeError("Use a new LLM after closing it or switching event loops")
         if loop is not self.loop:
             self.loop = loop
-            self.slots = {api: asyncio.Semaphore(self.concurrency) for api in KEYS}
+            self.slots = {api: asyncio.Semaphore(min(self.concurrency, API_CONCURRENCY.get(api, self.concurrency)))
+                          for api in KEYS}
             self.waiting = {api: [] for api in BATCH_APIS}  # (request, future, model) not yet sent in a batch.
             self.timers = {}
             self.running = {}  # Batch task -> jobs; includes tasks canceled before their coroutine starts.

@@ -109,7 +109,7 @@ def test_public_ask_and_cost(api):
 def test_extra_body_and_shared_settings(api):
     async def run():
         llm, _, call = setup(api)
-        model = 'gpt-5.4' if api == 'openai' else MODELS_BY_API[api]
+        model = {'openai': 'gpt-5.4', 'anthropic': 'sonnet-4.6'}.get(api, MODELS_BY_API[api])  # Models that take a temperature
         await llm.ask(model, MESSAGES, max_tokens=42, temperature=.2, top_p=.8, tools=[TOOL],
                       parallel_tool_calls=False, extra_body={'metadata': {'test': 'value'}})
         body = call.call_args.kwargs
