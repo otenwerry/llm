@@ -32,6 +32,7 @@ BASE_URLS = {"openrouter": "https://openrouter.ai/api/v1", "abliteration": "http
 # Error codes that end a chat reply for good: retrying the same input gets the same answer. abliteration.ai's safety
 # policies send "policy_violation", before the reply (HTTP 403) or in place of the rest of it (a stream error).
 FINAL_CODES = ("policy_violation",)
+OPENAI_FINAL_CODES = ("cyber_policy", "invalid_prompt")  # OpenAI's policy blocks: sending again won't change them.
 UNSUPPORTED = {  # Shared settings each API has no way to take.
     "anthropic": {"seed", "frequency_penalty", "presence_penalty", "verbosity", "logprobs"},
     "openai": {"top_k", "seed", "frequency_penalty", "presence_penalty", "stop"},
@@ -499,6 +500,18 @@ class LLM:
                     except (openai.APIConnectionError, anthropic.APIConnectionError, asyncio.CancelledError):
                         self._record(model, None)  # A request may have been billed before the connection was lost.
                         raise
+                    except openai.APIError as e:
+                        # An error event inside an OpenAI stream (e.g. "Our servers are currently overloaded"): the
+                        # SDK's retries only cover errors before the stream starts. Policy blocks aren't retried.
+                        if api != "openai" or isinstance(e, openai.APIStatusError) or e.code in OPENAI_FINAL_CODES:
+                            raise
+                        self._record(model, None)  # It may have been billed before it broke off.
+                        if attempt == self.max_retries:
+                            raise
+                        failed.append({"error": f"OpenAI error mid-reply: {e.message}", "cost": None})
+                        print(f"{model}: OpenAI error mid-reply ({e.message}); sending again "
+                              f"({attempt + 1}/{self.max_retries})", flush=True)
+                        await asyncio.sleep(2 ** attempt)
         reply.settings = {**settings, **({"cache": marks} if marks else {}), **({"batch": True} if batch else {})}
         reply.model, reply.model_id = model, spec["id"]
         return reply

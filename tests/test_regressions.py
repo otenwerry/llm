@@ -485,6 +485,32 @@ def test_openrouter_safety_block_mid_stream_is_not_retried(monkeypatch):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('code, retried', [('server_error', True), ('cyber_policy', False)])
+def test_openai_error_mid_stream_is_retried_unless_a_policy_block(monkeypatch, code, retried):
+    import openai
+    monkeypatch.setattr('llm.api.asyncio.sleep', AsyncMock())
+    async def run():
+        llm, _, call = setup('openai')
+        error = openai.APIError('Our servers are currently overloaded.', httpx.Request('POST', 'https://api.openai.com'),
+                                body={'code': code, 'message': 'Our servers are currently overloaded.'})
+        real = llm._openai
+        tries = []
+        async def flaky(model, request):
+            tries.append(1)
+            if len(tries) == 1:
+                raise error
+            return await real(model, request)
+        llm._openai = flaky
+        if retried:
+            reply = await llm.ask('gpt-5.4', MESSAGES)
+            assert len(tries) == 2 and 'overloaded' in reply.failed_attempts[0]['error']
+        else:
+            with pytest.raises(openai.APIError):
+                await llm.ask('gpt-5.4', MESSAGES)
+            assert len(tries) == 1
+    asyncio.run(run())
+
+
 def test_failed_attempts_are_recorded_and_reported_costs_kept(monkeypatch):
     monkeypatch.setattr('llm.api.asyncio.sleep', AsyncMock())
     async def run():
