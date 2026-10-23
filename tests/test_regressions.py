@@ -473,6 +473,18 @@ def test_openrouter_error_mid_stream_is_retried(monkeypatch):
     asyncio.run(run())
 
 
+def test_openrouter_safety_block_mid_stream_is_not_retried(monkeypatch):
+    import openai
+    monkeypatch.setattr('llm.api.asyncio.sleep', AsyncMock())
+    async def run():
+        body = {'code': 403, 'message': 'SAFETY', 'metadata': {'error_type': 'content_policy_violation', 'provider_code': 'SAFETY'}}
+        error = openai.APIError('SAFETY', httpx.Request('POST', 'https://openrouter.ai'), body=body)
+        llm, _, call = setup('openrouter', [MidStream(raw=response('openrouter'), error=error), response('openrouter')])
+        reply = await llm.ask('qwen-3.7-plus', MESSAGES)
+        assert call.await_count == 1 and reply.stop_reason == 'content_filter' and reply.failed_attempts == []
+    asyncio.run(run())
+
+
 def test_failed_attempts_are_recorded_and_reported_costs_kept(monkeypatch):
     monkeypatch.setattr('llm.api.asyncio.sleep', AsyncMock())
     async def run():

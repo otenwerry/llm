@@ -728,8 +728,12 @@ class LLM:
                 keep_partial(e, message.get("content") or "", reasoning_of(message))
                 raise
             # A host error after the stream began: the SDK raises it on OpenRouter's error chunk. It is retried like
-            # an unstreamed reply with finish_reason "error"; no usage arrives, so its cost is unknown.
-            response["error"], choice["finish_reason"] = e.body, "error"
+            # an unstreamed reply with finish_reason "error"; no usage arrives, so its cost is unknown. A host's
+            # safety filter refusing the request (e.g. Google's 403 "SAFETY") would only refuse again, so it ends the
+            # reply as a content filter stop instead.
+            blocked = isinstance(e.body, dict) and (e.body.get("metadata") or {}).get("error_type") == \
+                "content_policy_violation"
+            response["error"], choice["finish_reason"] = e.body, "content_filter" if blocked else "error"
         except BaseException as e:
             keep_partial(e, message.get("content") or "", reasoning_of(message))
             raise
