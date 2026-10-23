@@ -84,6 +84,7 @@ api = "anthropic"
 id = "claude-opus-4-6"
 caching = "paid"
 max_tokens = 128_000
+temperature = false  # Rejected with "temperature: Extra inputs are not permitted" (2026-10-22)
 price = { input = 5.00, output = 25.00, cache_read = 0.50, cache_write = 6.25, cache_write_1h = 10.00 }
 
 ["sonnet-5.5"]
