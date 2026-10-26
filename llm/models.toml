@@ -334,6 +334,13 @@ max_tokens = 65_536
 
 # OpenRouter, pinned to a big cloud host because the maker doesn't serve the model there (see README.md).
 
+["muse-spark-open"]
+api = "openrouter"
+id = "meta/muse-spark-open"
+caching = "free"
+host = "together"
+max_tokens = 943_718
+
 ["deepseek-v4-pro"]
 api = "openrouter"
 id = "deepseek/deepseek-v4-pro"
