@@ -390,7 +390,7 @@ max_tokens = 115_200
 api = "openrouter"
 id = "qwen/qwen3.8-2.4t-a95b"  # The open-weight version of Qwen3.8 Max
 caching = "free"
-host = "together"
+host = "alibaba"
 max_tokens = 909_000
 
 ["qwen-3.8-27b"]
