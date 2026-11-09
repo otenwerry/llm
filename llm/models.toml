@@ -232,6 +232,13 @@ caching = "free"
 host = "xai"
 max_tokens = 450_000
 
+["grok-4.6"]
+api = "openrouter"
+id = "x-ai/grok-4.6"
+caching = "free"
+host = "xai"
+max_tokens = 450_000
+
 ["grok-4.5"]
 api = "openrouter"
 id = "x-ai/grok-4.5"
