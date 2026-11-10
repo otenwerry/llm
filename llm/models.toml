@@ -210,6 +210,13 @@ caching = "free"
 host = "google-vertex"  # Zero data retention; AI Studio isn't
 max_tokens = 65_536  # Vertex's us endpoint limit (its global one takes 943,718)
 
+["carbon-4"]
+api = "openrouter"
+id = "google/gemini-4-carbon"
+caching = "free"
+host = "google-vertex"  # Zero data retention; AI Studio isn't
+max_tokens = 65_536  # Vertex's us endpoint limit (its global one takes 943,718)
+
 ["gemini-3.8-flash"]
 api = "openrouter"
 id = "google/gemini-3.8-flash"
